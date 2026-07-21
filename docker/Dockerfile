@@ -3,7 +3,13 @@ FROM ubuntu:18.04
 # TODO remove sudo for user "magma" to avoid unwanted priv escalation from
 # other attack vectors.
 
-RUN apt-get update && apt-get install -y sudo
+RUN apt-get update && \
+	apt-get install -y sudo vim python3 python3-pip && \
+	rm -rf /var/lib/apt/lists/*
+
+# Install redis
+RUN pip3 install redis
+RUN pip3 install dataclasses
 
 ## Magma directory hierarchy
 # magma_root is relative to the docker-build's working directory
@@ -13,6 +19,7 @@ ARG magma_root=./
 ## Path variables inside the container
 ENV MAGMA_R /magma
 ENV OUT		/magma_out
+ENV OUT_COV /magma_out_cov
 ENV SHARED 	/magma_shared
 
 ENV CC  /usr/bin/gcc
@@ -31,9 +38,14 @@ RUN mkdir -p /home && \
 	chown magma:magma /home
 RUN	echo "magma:amgam" | chpasswd && usermod -a -G sudo magma
 
-RUN mkdir -p ${SHARED} ${OUT} && \
-	chown magma:magma ${SHARED} ${OUT} && \
-	chmod 744 ${SHARED} ${OUT}
+RUN mkdir -p ${SHARED} ${OUT} ${OUT_COV} && \
+	chown magma:magma ${SHARED} ${OUT} ${OUT_COV} && \
+	chmod 744 ${SHARED} ${OUT} ${OUT_COV}
+
+ENV MAGCOV  ${MAGMA_R}/magcov
+USER root:root
+RUN mkdir -p ${MAGCOV} && chown magma:magma ${MAGCOV}
+COPY --chown=magma:magma ${magma_root}/magcov ${MAGCOV}/
 
 ARG magma_path=magma
 ENV MAGMA 	${MAGMA_R}/${magma_path}
@@ -81,8 +93,27 @@ ARG BUILD_FLAGS="-include ${MAGMA}/src/canary.h ${CANARIES_FLAG} ${FIXES_FLAG} $
 ENV CFLAGS ${BUILD_FLAGS}
 ENV CXXFLAGS ${BUILD_FLAGS}
 ENV LIBS -l:magma.o -lrt
-ENV LDFLAGS -L"${OUT}" -g
+ENV LDFLAGS -L"${OUT}" -L"${OUT_COV}"  -g
 
 RUN ${FUZZER}/instrument.sh
+
+## Use llvm_cov to measure coverage
+ENV FUZZER_COV ${MAGMA_R}/fuzzers/llvm_cov
+USER root:root
+RUN mkdir -p ${FUZZER_COV} && chown magma:magma ${FUZZER_COV}
+COPY --chown=magma:magma ${magma_root}/fuzzers/llvm_cov ${FUZZER_COV}/
+RUN ${FUZZER_COV}/preinstall.sh
+USER magma:magma
+RUN ${FUZZER_COV}/fetch.sh
+
+## Build target program for coverage measurement
+ENV TARGET_COV ${MAGMA_R}/${target_path}_cov
+USER root:root
+RUN mkdir -p ${TARGET_COV} && chown magma:magma ${TARGET_COV}
+COPY --chown=magma:magma ${magma_root}/${target_path} ${TARGET_COV}/
+RUN ${TARGET_COV}/preinstall.sh
+USER magma:magma
+RUN ${TARGET_COV}/fetch_cov.sh
+RUN ${MAGMA}/apply_patches_cov.sh
 
 ENTRYPOINT "${MAGMA}/run.sh"
