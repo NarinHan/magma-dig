@@ -34,6 +34,7 @@ export CAMPAIGN_WORKERS=${CAMPAIGN_WORKERS:-1}
 TMPFS_SIZE=${TMPFS_SIZE:-50g}
 export POLL=${POLL:-5}
 export TIMEOUT=${TIMEOUT:-1m}
+export LLVM_COV=${LLVM_COV:-1}
 
 WORKDIR="$(realpath "$WORKDIR")"
 export ARDIR="$WORKDIR/ar"
