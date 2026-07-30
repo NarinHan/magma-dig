@@ -1,222 +1,289 @@
+#!/usr/bin/env python3
+import argparse
 import csv
 import json
 import os
 import sys
-import argparse
 from pathlib import Path
 
-BRANCH_KIND = 3  # llvm-cov region kind for branches
 
-def log(msg):
-    print(f"[INFO] {msg}")
+BRANCH_KIND = 3
 
-def log_error(msg):
-    print(f"[ERROR] {msg}", file=sys.stderr)
 
-def normalize_seed_base(filename):
-    if filename.endswith(".prof.json"):
-        return filename[:-len(".prof.json")]
-    if filename.endswith(".json"):
-        return filename[:-len(".json")]
-    return filename
+class CoverageProcessingError(RuntimeError):
+    pass
 
-# ---------------- LINE EXTRACTION ----------------
 
-def extract_executed_lines(cov_json):
-    out = {}
+def load_json(path):
+    path = Path(path)
+    with path.open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise CoverageProcessingError(
+            "Expected one JSON object in {0}".format(path)
+        )
+    return value
+
+
+def save_json_atomic(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(str(temporary), str(path))
+
+
+def extract_executed_lines(coverage_json):
+    result = {}
 
     def add_line(line_counts, line, count):
-        if isinstance(line, int) and line > 0 and isinstance(count, int) and count > 0:
+        if (
+            isinstance(line, int)
+            and line > 0
+            and isinstance(count, int)
+            and count > 0
+        ):
             line_counts[line] = max(line_counts.get(line, 0), count)
 
-    for b in cov_json.get("data", []):
-        for fobj in b.get("files", []):
-            fname = fobj.get("filename")
-            if not fname:
+    for data_item in coverage_json.get("data", []):
+        for file_item in data_item.get("files", []):
+            filename = file_item.get("filename")
+            if not filename:
                 continue
-
-            line_counts = out.setdefault(fname, {})
-
+            line_counts = result.setdefault(filename, {})
             segments = [
-                seg for seg in fobj.get("segments", [])
-                if isinstance(seg, list) and len(seg) >= 4
+                segment
+                for segment in file_item.get("segments", [])
+                if isinstance(segment, list) and len(segment) >= 4
             ]
-
-            # llvm-cov export segments are coverage change points, not per-line rows.
-            # A covered segment starting on line N can span multiple source lines until
-            # the next segment begins, so record the whole covered line range.
-            for idx, seg in enumerate(segments):
-                line, count, hasCount = seg[0], seg[2], seg[3]
-                if not (hasCount and isinstance(count, int) and count > 0):
+            for index, segment in enumerate(segments):
+                line = segment[0]
+                count = segment[2]
+                has_count = segment[3]
+                if not (
+                    has_count
+                    and isinstance(count, int)
+                    and count > 0
+                ):
                     continue
-
                 add_line(line_counts, line, count)
-
-                if idx + 1 >= len(segments):
+                if index + 1 >= len(segments):
                     continue
-
-                next_line = segments[idx + 1][0]
+                next_line = segments[index + 1][0]
                 if not isinstance(next_line, int) or next_line <= line:
                     continue
-
                 for covered_line in range(line + 1, next_line):
                     add_line(line_counts, covered_line, count)
 
-    return {fn: lc for fn, lc in out.items() if lc}
+    return {
+        filename: line_counts
+        for filename, line_counts in result.items()
+        if line_counts
+    }
 
-# ---------------- BRANCH EXTRACTION ----------------
 
-def extract_executed_branch_regions(cov_json):
-    out = {}
+def extract_executed_branch_regions(coverage_json):
+    result = {}
 
-    def add_region(fname, arr):
-        if not (isinstance(arr, list) and len(arr) >= 8):
+    def add_region(filename, region):
+        if not isinstance(region, list) or len(region) < 8:
             return
-        ls, cs, le, ce, cnt, kind = arr[0], arr[1], arr[2], arr[3], arr[4], arr[7]
-        if kind != BRANCH_KIND or cnt <= 0:
+        count = region[4]
+        if region[7] != BRANCH_KIND or not isinstance(count, int) or count <= 0:
             return
+        result.setdefault(filename, []).append(
+            {
+                "line_start": region[0],
+                "col_start": region[1],
+                "line_end": region[2],
+                "col_end": region[3],
+                "count": count,
+            }
+        )
 
-        out.setdefault(fname, []).append({
-            "line_start": ls,
-            "col_start": cs,
-            "line_end": le,
-            "col_end": ce,
-            "count": cnt,
-        })
-
-    for b in cov_json.get("data", []):
-        for fobj in b.get("files", []):
-            fname = fobj.get("filename")
-            if not fname:
+    for data_item in coverage_json.get("data", []):
+        for file_item in data_item.get("files", []):
+            filename = file_item.get("filename")
+            if not filename:
                 continue
+            for region in file_item.get("regions", []) or []:
+                add_region(filename, region)
+            for expansion in file_item.get("expansions", []) or []:
+                for region in expansion.get("target_regions", []) or []:
+                    add_region(filename, region)
 
-            # direct regions (if present)
-            for r in fobj.get("regions", []) or []:
-                add_region(fname, r)
-
-            # expansions (your case)
-            for ex in fobj.get("expansions", []) or []:
-                for r in ex.get("target_regions", []) or []:
-                    add_region(fname, r)
-
-    # deduplicate and sort
     cleaned = {}
-    for fn, lst in out.items():
+    for filename, regions in result.items():
         seen = set()
-        uniq = []
-        for br in lst:
-            key = (br["line_start"], br["col_start"], br["line_end"], br["col_end"])
+        unique = []
+        for region in regions:
+            key = (
+                region["line_start"],
+                region["col_start"],
+                region["line_end"],
+                region["col_end"],
+            )
             if key in seen:
                 continue
             seen.add(key)
-            uniq.append(br)
-        uniq.sort(key=lambda x: (x["line_start"], x["col_start"]))
-        cleaned[fn] = uniq
-
+            unique.append(region)
+        unique.sort(key=lambda item: (item["line_start"], item["col_start"]))
+        cleaned[filename] = unique
     return cleaned
 
-# ---------------- WRITERS ----------------
 
-def write_lines_json(path, seed, lines_cov):
-    obj = {
-        "seed": seed,
-        "files": [
-            {"filename": fn, "lines": [{"line": l, "count": c} for l, c in sorted(lines_cov[fn].items())]}
-            for fn in sorted(lines_cov.keys())
-        ]
-    }
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2)
+def coverage_seed_name(profjson_path):
+    name = Path(profjson_path).name
+    if name.endswith(".prof.json"):
+        return name[: -len(".prof.json")]
+    if name.endswith(".json"):
+        return name[: -len(".json")]
+    return name
 
-def write_branches_json(path, seed, br_cov):
-    obj = {
-        "seed": seed,
-        "files": [
-            {"filename": fn, "branches": br_cov[fn]}
-            for fn in sorted(br_cov.keys())
-        ]
-    }
-    with open(path, "w") as f:
-        json.dump(obj, f, indent=2)
 
-def write_lines_csv(path, lines_cov):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["filename", "line", "count"])
-        for fn in sorted(lines_cov.keys()):
-            for l, c in sorted(lines_cov[fn].items()):
-                w.writerow([fn, l, c])
+def write_line_coverage(path, processed_format, seed, line_coverage):
+    if processed_format == "json":
+        save_json_atomic(
+            path,
+            {
+                "seed": seed,
+                "files": [
+                    {
+                        "filename": filename,
+                        "lines": [
+                            {"line": line, "count": count}
+                            for line, count in sorted(
+                                line_coverage[filename].items()
+                            )
+                        ],
+                    }
+                    for filename in sorted(line_coverage)
+                ],
+            },
+        )
+        return
 
-def write_branches_csv(path, br_cov):
-    with open(path, "w", newline="") as f:
-        w = csv.writer(f)
-        w.writerow(["filename", "line_start", "col_start", "line_end", "col_end", "count"])
-        for fn in sorted(br_cov.keys()):
-            for br in br_cov[fn]:
-                w.writerow([fn, br["line_start"], br["col_start"], br["line_end"], br["col_end"], br["count"]])
+    with Path(path).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["filename", "line", "count"])
+        for filename in sorted(line_coverage):
+            for line, count in sorted(line_coverage[filename].items()):
+                writer.writerow([filename, line, count])
 
-# ---------------- MAIN ----------------
 
-def main():
-    parser = argparse.ArgumentParser(description="Process llvm-cov JSON to extract line and branch coverage.")
-    parser.add_argument("--format", choices=["json", "csv"], default="csv",
-                        help="Output format: json or csv (default: csv)")
-    parser.add_argument("--input-file", type=str, default=None,
-                        help="Process a single llvm-cov JSON file (path). If omitted, process all in $COV_DIR/profjson.")
-    parser.add_argument("--output-dir", type=str, default=None,
-                        help="Output directory. Default: $COV_DIR/coverage")
-    args = parser.parse_args()
+def write_branch_coverage(path, processed_format, seed, branch_coverage):
+    if processed_format == "json":
+        save_json_atomic(
+            path,
+            {
+                "seed": seed,
+                "files": [
+                    {
+                        "filename": filename,
+                        "branches": branch_coverage[filename],
+                    }
+                    for filename in sorted(branch_coverage)
+                ],
+            },
+        )
+        return
 
-    cov_dir = os.environ.get("COV_DIR")
-    if not cov_dir:
-        log_error("Please set COV_DIR environment variable")
-        sys.exit(1)
+    with Path(path).open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "filename",
+                "line_start",
+                "col_start",
+                "line_end",
+                "col_end",
+                "count",
+            ]
+        )
+        for filename in sorted(branch_coverage):
+            for branch in branch_coverage[filename]:
+                writer.writerow(
+                    [
+                        filename,
+                        branch["line_start"],
+                        branch["col_start"],
+                        branch["line_end"],
+                        branch["col_end"],
+                        branch["count"],
+                    ]
+                )
 
-    cov_dir = Path(cov_dir)
-    input_dir = cov_dir / "profjson"
 
-    output_dir = Path(args.output_dir) if args.output_dir else (cov_dir / "coverage")
+def process_coverage_export(profjson_path, output_dir, processed_format):
+    processed_format = str(processed_format).strip().lower()
+    if processed_format not in ("csv", "json"):
+        raise CoverageProcessingError(
+            "format must be csv or json: {0}".format(processed_format)
+        )
+
+    coverage_json = load_json(profjson_path)
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    seed = coverage_seed_name(profjson_path)
+    line_path = output_dir / "line.{0}".format(processed_format)
+    branch_path = output_dir / "branch.{0}".format(processed_format)
+    write_line_coverage(
+        line_path,
+        processed_format,
+        seed,
+        extract_executed_lines(coverage_json),
+    )
+    write_branch_coverage(
+        branch_path,
+        processed_format,
+        seed,
+        extract_executed_branch_regions(coverage_json),
+    )
+    return line_path, branch_path
 
-    log(f"Output format: {args.format}")
 
-    # Determine input files
-    if args.input_file:
-        jp = Path(args.input_file)
-        files = [jp]
-        log(f"Reading single file: {jp}")
-    else:
-        files = sorted(input_dir.glob("*.json"))
-        log(f"Reading from: {input_dir}")
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(
+        description="Convert one llvm-cov export into line and branch coverage."
+    )
+    parser.add_argument("--input-file", required=True)
+    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--format", choices=("csv", "json"), default="csv")
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args(argv)
 
-    log(f"Writing to: {output_dir}")
-    log(f"Found {len(files)} file(s)")
 
-    for i, jp in enumerate(files, 1):
-        seed = normalize_seed_base(jp.name)
-        log(f"[{i}/{len(files)}] Processing {jp.name}")
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        line_path, branch_path = process_coverage_export(
+            profjson_path=Path(args.input_file),
+            output_dir=Path(args.output_dir),
+            processed_format=args.format,
+        )
+    except (CoverageProcessingError, OSError, ValueError) as error:
+        print(
+            "Coverage processing failed: {0}".format(error),
+            file=sys.stderr,
+        )
+        return 1
 
-        try:
-            with open(jp) as f:
-                cov_json = json.load(f)
-        except Exception as e:
-            log_error(f"Failed to read {jp}: {e}")
-            continue
+    if args.verbose:
+        print(
+            json.dumps(
+                {
+                    "line_coverage_path": str(line_path),
+                    "branch_coverage_path": str(branch_path),
+                },
+                sort_keys=True,
+            )
+        )
+    return 0
 
-        lines_cov = extract_executed_lines(cov_json)
-        branch_cov = extract_executed_branch_regions(cov_json)
-
-        if args.format == "json":
-            write_lines_json(output_dir / f"{seed}.line.json", seed, lines_cov)
-            write_branches_json(output_dir / f"{seed}.branch.json", seed, branch_cov)
-        else:
-            write_lines_csv(output_dir / f"{seed}.line.csv", lines_cov)
-            write_branches_csv(output_dir / f"{seed}.branch.csv", branch_cov)
-
-        log(f"  -> written {seed}.line.{args.format} and {seed}.branch.{args.format}")
-
-    log("Done.")
 
 if __name__ == "__main__":
-    main()
-
+    raise SystemExit(main())
