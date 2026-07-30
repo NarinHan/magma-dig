@@ -4,7 +4,7 @@ FROM ubuntu:18.04
 # other attack vectors.
 
 RUN apt-get update && \
-	apt-get install -y sudo vim python3 python3-pip && \
+	apt-get install -y sudo vim python3 python3-pip gdb && \
 	rm -rf /var/lib/apt/lists/*
 
 # Install redis
