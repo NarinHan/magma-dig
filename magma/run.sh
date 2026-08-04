@@ -78,3 +78,8 @@ fi
 echo "Campaign terminated at $(date '+%F %R')"
 
 kill $(jobs -p)
+
+echo "Keeping the container alive for inspection"
+echo "Use 'docker exec -it <container_id> /bin/bash' to connect."
+
+tail -f /dev/null
