@@ -20,7 +20,7 @@ export LDFLAGS="$LDFLAGS -fprofile-instr-generate -fcoverage-mapping"
 export LIBS="$LIBS -l:StandaloneFuzzTargetMain.o -lstdc++"
 
 "$MAGMA/build_cov.sh"
-"$TARGET_OUT/build_cov.sh"
+"$TARGET_COV/build_cov.sh"
 
 # NOTE: We pass $OUT directly to the target build.sh script, since the artifact
 #       itself is the fuzz target. In the case of Angora, we might need to
