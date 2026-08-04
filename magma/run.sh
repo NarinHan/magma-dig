@@ -77,6 +77,10 @@ fi
 
 echo "Campaign terminated at $(date '+%F %R')"
 
+if [ "${LLVM_COV:-0}" = "1" ] && [ -x "/magma/magcov/build_target_cov.sh" ]; then
+	/magma/magcov/build_target_cov.sh 2>&1 | tee -a "$SHARED/log/build_cov_log"
+fi
+
 kill $(jobs -p)
 
 echo "Keeping the container alive for inspection"
